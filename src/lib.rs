@@ -1,17 +1,16 @@
 extern crate slice_deque;
 
 use std::io::{self, Write, BufWriter};
-use std::mem;
 
-pub(crate) mod buffer;
 pub(crate) mod vint;
 pub mod value;
+mod merge;
 
-use self::buffer::Buffer;
+const END_CODE: u8 = 0u8;
+const VINT_MODE: u8 = 1u8;
 
 const DEFAULT_KEY_CAPACITY: usize = 50;
 const FOUR_BIT_LIMITS: usize = 1 << 4;
-const BUFFER_AHEAD: usize = 4_096;
 
 fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
     left.iter().cloned()
@@ -34,13 +33,11 @@ pub trait SSTable {
         }
     }
 
-    fn reader<R: io::Read>(data: R) -> Reader<R, Self::Reader> {
+    fn reader<R: io::BufRead>(reader: R) -> Reader<R, Self::Reader> {
         Reader {
-            data,
             key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
             value_reader: Self::Reader::default(),
-            buffer: Buffer::new(),
-            spare_buffer: Buffer::new(),
+            reader,
         }
     }
 }
@@ -54,49 +51,64 @@ impl SSTable for VoidSSTable {
 }
 
 pub struct Reader<R, TValueReader> {
-    data: R,
     key: Vec<u8>,
     value_reader: TValueReader,
-    buffer: Buffer,
-    spare_buffer: Buffer,
+    reader: R,
+}
+
+fn pop_byte<R: io::BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
+    let b: u8 = {
+        let available_data = reader.fill_buf()?;
+        if available_data.is_empty() {
+            return Ok(None);
+        }
+        available_data[0]
+    };
+    reader.consume(1);
+    Ok(Some(b))
 }
 
 impl<R,TValueReader> Reader<R,TValueReader>
-    where R: io::Read, TValueReader: value::ValueReader {
-    fn read_key(&mut self) -> io::Result<bool> {
-        let b: u8 = self.buffer.pop_byte();
-        let keep: usize;
-        let add: usize;
-        if b == 0 {
-            keep = self.buffer.deserialize_u64() as usize;
-            if keep == 0 {
-                return Ok(false);
+    where R: io::BufRead, TValueReader: value::ValueReader {
+
+    // This method consumes
+    // Disclaimer this code is clunky because of the borrow checker.
+    fn read_keep_add(&mut self) -> io::Result<Option<(usize, usize)>> {
+        match pop_byte(&mut self.reader)? {
+            None | Some(END_CODE) => {
+                Ok(None)
             }
-            add = self.buffer.deserialize_u64() as usize;
-        } else {
-            keep = (b & 0b1111) as usize;
-            add = (b >> 4) as usize;
+            Some(VINT_MODE) => {
+                let keep = vint::deserialize_read(&mut self.reader)? as usize;
+                let add = vint::deserialize_read(&mut self.reader)? as usize;
+                Ok(Some((keep, add)))
+            }
+            Some(b) => {
+                let keep = (b & 0b1111) as usize;
+                let add = (b >> 4) as usize;
+                Ok(Some((keep, add)))
+            }
         }
-        self.key.resize(keep, 0u8);
-        self.key.extend_from_slice(self.buffer.pop_slice(add));
-        Ok(true)
     }
 
-    fn fill_buffer(&mut self) -> io::Result<()> {
-        self.spare_buffer.copy_from(&self.buffer);
-        mem::swap(&mut self.spare_buffer, &mut self.buffer);
-        self.buffer.fill(&mut self.data)
+    fn read_key(&mut self) -> io::Result<bool> {
+        if let Some((keep, add)) = self.read_keep_add()? {
+            self.key.resize(keep + add, 0u8);
+            self.reader.read_exact(&mut self.key[keep..])?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     pub fn advance(&mut self) -> io::Result<bool> {
-        if self.buffer.available() < BUFFER_AHEAD {
-            self.fill_buffer()?;
+        if self.read_key()? {
+            self.value_reader.read(&mut self.reader)?;
+            Ok(true)
+        } else {
+            Ok(false)
         }
-        if !self.read_key()? {
-            return Ok(false);
-        }
-        self.value_reader.read(&mut self.data)?;
-        Ok(true)
+
     }
 
     pub fn key(&self) -> &[u8] {
@@ -124,14 +136,14 @@ impl<W, TValueWriter> Writer<W, TValueWriter>
             let b = (keep_len | add_len << 4) as u8;
             self.write.write_all(&[b])
         } else {
-            let mut buf = [0u8; 20];
-            let mut len = vint::serialize(keep_len as u64, &mut buf[..]);
+            let mut buf = [1u8; 20];
+            let mut len = 1 + vint::serialize(keep_len as u64, &mut buf[1..]);
             len += vint::serialize(add_len as u64, &mut buf[len..]);
             self.write.write_all(&mut buf[..len])
         }
     }
 
-    fn write(&mut self, key: &[u8], value: &TValueWriter::Value) -> io::Result<()> {
+    pub fn write(&mut self, key: &[u8], value: &TValueWriter::Value) -> io::Result<()> {
         let keep_len = common_prefix_len(&self.previous_key, key);
         let add_len = key.len() - keep_len;
         let increasing_keys =
@@ -148,7 +160,7 @@ impl<W, TValueWriter> Writer<W, TValueWriter>
         Ok(())
     }
 
-    fn finalize(mut self) -> io::Result<()> {
+    pub fn finalize(mut self) -> io::Result<()> {
         self.write.write(&[0u8, 0u8])?;
         self.write.flush()
     }
@@ -172,6 +184,29 @@ mod tests {
         aux_test_common_prefix_len("", "ab", 0);
         aux_test_common_prefix_len("ab", "abc", 2);
         aux_test_common_prefix_len("abde", "abce", 2);
+    }
+
+
+    #[test]
+    fn test_long_key_diff() {
+        let long_key = (0..1_024).map(|x| (x % 255) as u8).collect::<Vec<_>>();
+        let long_key2 = (1..300).map(|x| (x % 255) as u8).collect::<Vec<_>>();
+        let mut buffer = vec![];
+        {
+            let mut sstable_writer = VoidSSTable::writer(&mut buffer);
+            assert!(sstable_writer.write(&long_key[..], &()).is_ok());
+            assert!(sstable_writer.write(&[0,3,4], &()).is_ok());
+            assert!(sstable_writer.write(&long_key2[..], &()).is_ok());
+            assert!(sstable_writer.finalize().is_ok());
+        }
+        let mut sstable_reader = VoidSSTable::reader(&buffer[..]);
+        assert!(sstable_reader.advance().unwrap());
+        assert_eq!(sstable_reader.key(), &long_key[..]);
+        assert!(sstable_reader.advance().unwrap());
+        assert_eq!(sstable_reader.key(), &[0,3,4]);
+        assert!(sstable_reader.advance().unwrap());
+        assert_eq!(sstable_reader.key(), &long_key2[..]);
+        assert!(!sstable_reader.advance().unwrap());
     }
 
     #[test]

@@ -1,4 +1,3 @@
-
 use std::io;
 
 pub trait ValueReader: Default {
@@ -7,7 +6,7 @@ pub trait ValueReader: Default {
 
     fn value(&self) -> &Self::Value;
 
-    fn read<R: io::Read>(&mut self, reader: &mut R) -> io::Result<()>;
+    fn read<R: io::BufRead>(&mut self, reader: &mut R) -> io::Result<()>;
 }
 
 pub trait ValueWriter: Default {
@@ -28,7 +27,7 @@ impl ValueReader for VoidReader {
         &()
     }
 
-    fn read<R: io::Read>(&mut self, _read: &mut R) -> io::Result<()> {
+    fn read<R: io::BufRead>(&mut self, _reader: &mut R) -> io::Result<()> {
         Ok(())
     }
 }
