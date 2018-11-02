@@ -1,10 +1,14 @@
 extern crate slice_deque;
 
 use std::io::{self, Write, BufWriter};
+use merge::ValueMerger;
 
 pub(crate) mod vint;
 pub mod value;
 mod merge;
+
+//pub use self::merge::{KeepFirst, VoidMerge};
+pub use self::merge::VoidMerge;
 
 const END_CODE: u8 = 0u8;
 const VINT_MODE: u8 = 1u8;
@@ -19,7 +23,7 @@ fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
         .count()
 }
 
-pub trait SSTable {
+pub trait SSTable: Sized {
 
     type Value;
     type Reader: value::ValueReader<Value=Self::Value>;
@@ -40,6 +44,18 @@ pub trait SSTable {
             reader,
         }
     }
+
+    fn merge<R: io::BufRead, W: io::Write, M: ValueMerger<Self::Value>>(io_readers: Vec<R>, w: W, merger: M) -> io::Result<()> {
+        let mut readers = vec![];
+        for io_reader in io_readers.into_iter() {
+            let mut reader = Self::reader(io_reader);
+            if reader.advance()? {
+                readers.push(reader)
+            }
+        }
+        let writer = Self::writer(w);
+        merge::merge_sstable::<Self, _, _, _>(readers, writer, merger)
+    }
 }
 
 pub struct VoidSSTable;
@@ -48,6 +64,8 @@ impl SSTable for VoidSSTable {
     type Value = ();
     type Reader = value::VoidReader;
     type Writer = value::VoidWriter;
+
+
 }
 
 pub struct Reader<R, TValueReader> {
@@ -120,6 +138,11 @@ impl<R,TValueReader> Reader<R,TValueReader>
     }
 }
 
+impl<R,TValueReader> AsRef<[u8]> for Reader<R,TValueReader> {
+    fn as_ref(&self) -> &[u8] {
+        &self.key
+    }
+}
 
 pub struct Writer<W, TValueWriter>
     where W: io::Write {
@@ -143,20 +166,34 @@ impl<W, TValueWriter> Writer<W, TValueWriter>
         }
     }
 
-    pub fn write(&mut self, key: &[u8], value: &TValueWriter::Value) -> io::Result<()> {
+    pub(crate) fn current_key(&self) -> &[u8] {
+        &self.previous_key[..]
+    }
+
+    pub(crate) fn write_key(&mut self, key: &[u8]) -> io::Result<()> {
         let keep_len = common_prefix_len(&self.previous_key, key);
         let add_len = key.len() - keep_len;
         let increasing_keys =
-            add_len > 0 &&
-                (self.previous_key.len() == keep_len ||
-                 self.previous_key[keep_len] < key[keep_len]);
+        add_len > 0 &&
+        (self.previous_key.len() == keep_len ||
+        self.previous_key[keep_len] < key[keep_len]);
         assert!(increasing_keys, "Keys should be increasing. ({:?} > {:?})", self.previous_key, key);
         let extension = &key[keep_len..];
         self.previous_key.resize(keep_len, 0u8);
         self.previous_key.extend_from_slice(extension);
         self.encode_keep_add(keep_len, add_len)?;
         self.write.write_all(extension)?;
+        Ok(())
+    }
+
+    pub(crate) fn write_value(&mut self, value: &TValueWriter::Value) -> io::Result<()> {
         self.value_writer.write(value, &mut self.write)?;
+        Ok(())
+    }
+
+    pub fn write(&mut self, key: &[u8], value: &TValueWriter::Value) -> io::Result<()> {
+        self.write_key(key)?;
+        self.write_value(value)?;
         Ok(())
     }
 
