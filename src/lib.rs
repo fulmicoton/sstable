@@ -68,12 +68,6 @@ impl SSTable for VoidSSTable {
 
 }
 
-pub struct Reader<R, TValueReader> {
-    key: Vec<u8>,
-    value_reader: TValueReader,
-    reader: R,
-}
-
 fn pop_byte<R: io::BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
     let b: u8 = {
         let available_data = reader.fill_buf()?;
@@ -86,31 +80,17 @@ fn pop_byte<R: io::BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
     Ok(Some(b))
 }
 
+pub struct Reader<R, TValueReader> {
+    key: Vec<u8>,
+    value_reader: TValueReader,
+    reader: R,
+}
+
 impl<R,TValueReader> Reader<R,TValueReader>
     where R: io::BufRead, TValueReader: value::ValueReader {
 
-    // This method consumes
-    // Disclaimer this code is clunky because of the borrow checker.
-    fn read_keep_add(&mut self) -> io::Result<Option<(usize, usize)>> {
-        match pop_byte(&mut self.reader)? {
-            None | Some(END_CODE) => {
-                Ok(None)
-            }
-            Some(VINT_MODE) => {
-                let keep = vint::deserialize_read(&mut self.reader)? as usize;
-                let add = vint::deserialize_read(&mut self.reader)? as usize;
-                Ok(Some((keep, add)))
-            }
-            Some(b) => {
-                let keep = (b & 0b1111) as usize;
-                let add = (b >> 4) as usize;
-                Ok(Some((keep, add)))
-            }
-        }
-    }
-
     fn read_key(&mut self) -> io::Result<bool> {
-        if let Some((keep, add)) = self.read_keep_add()? {
+        if let Some((keep, add)) = read_keep_add(&mut self.reader)? {
             self.key.resize(keep + add, 0u8);
             self.reader.read_exact(&mut self.key[keep..])?;
             Ok(true)
@@ -137,6 +117,26 @@ impl<R,TValueReader> Reader<R,TValueReader>
         self.value_reader.value()
     }
 }
+
+
+pub(crate) fn read_keep_add<R: io::BufRead>(reader: &mut R) -> io::Result<Option<(usize, usize)>> {
+    match pop_byte(reader)? {
+        None | Some(END_CODE) => {
+            Ok(None)
+        }
+        Some(VINT_MODE) => {
+            let keep = vint::deserialize_read(reader)? as usize;
+            let add = vint::deserialize_read(reader)? as usize;
+            Ok(Some((keep, add)))
+        }
+        Some(b) => {
+            let keep = (b & 0b1111) as usize;
+            let add = (b >> 4) as usize;
+            Ok(Some((keep, add)))
+        }
+    }
+}
+
 
 impl<R,TValueReader> AsRef<[u8]> for Reader<R,TValueReader> {
     fn as_ref(&self) -> &[u8] {
