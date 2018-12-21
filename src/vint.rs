@@ -1,4 +1,4 @@
-use std::io;
+use BlockReader;
 
 const CONTINUE_BIT: u8 = 128u8;
 
@@ -16,32 +16,22 @@ pub fn serialize(mut val: u64, buffer: &mut [u8]) -> usize {
     10 //< actually unreachable
 }
 
-
 // super slow but we don't care
-pub fn deserialize_read<R: io::BufRead>(reader: &mut R) -> io::Result<u64> {
+pub fn deserialize_read(block_reader: &mut BlockReader) -> u64 {
     let mut result = 0u64;
     let mut shift = 0u64;
     let mut consumed = 0;
-    'outer: loop {
-        {
-            let buf = reader.fill_buf()?;
-            if buf.is_empty() {
-                return Err(From::from(io::ErrorKind::UnexpectedEof));
-            }
-            for &b in buf {
-                consumed += 1;
-                result |= u64::from(b % 128u8) << shift;
-                if b < CONTINUE_BIT {
-                    break 'outer;
-                }
-                shift += 7;
-            }
+
+    for &b in block_reader.buffer() {
+        consumed += 1;
+        result |= u64::from(b % 128u8) << shift;
+        if b < CONTINUE_BIT {
+            break;
         }
-        reader.consume(consumed);
-        consumed = 0;
+        shift += 7;
     }
-    reader.consume(consumed);
-    Ok(result)
+    block_reader.consume(consumed);
+    result
 }
 
 
@@ -50,17 +40,18 @@ mod tests {
     use vint::serialize;
     use vint::deserialize_read;
     use std::u64;
-    use std::io::{Read, BufReader};
+    use BlockReader;
+    use byteorder::{ByteOrder, LittleEndian};
 
     fn aux_test_int(val: u64, expect_len: usize) {
-        let mut buffer = [0u8; 10];
-        assert_eq!(serialize(val, &mut buffer[..]), expect_len);
-        let mut r: &[u8] = &mut &buffer[..];
-        let mut buf_reader = BufReader::new(&mut r);
-        assert_eq!(deserialize_read(&mut buf_reader).unwrap(), val);
-        let mut v = vec![];
-        buf_reader.read_to_end(&mut v).unwrap();
-        assert_eq!(expect_len + v.len(), buffer.len());
+        let mut buffer = [0u8; 14];
+        LittleEndian::write_u32(&mut buffer[..4], 10);
+        assert_eq!(serialize(val, &mut buffer[4..]), expect_len);
+        let r: &[u8] = &mut &buffer[..];
+        let mut block_reader = BlockReader::new(Box::new(r));
+        assert!(block_reader.read_block().unwrap());
+        assert_eq!(deserialize_read(&mut block_reader), val);
+        assert_eq!(expect_len + block_reader.buffer().len() + 4, buffer.len());
     }
 
     #[test]

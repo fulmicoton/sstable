@@ -1,8 +1,10 @@
 extern crate slice_deque;
 extern crate core;
+extern crate byteorder;
 
 use std::io::{self, Write, BufWriter};
 use merge::ValueMerger;
+use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
 
 pub(crate) mod vint;
 pub mod value;
@@ -11,6 +13,8 @@ pub mod merge;
 //pub use self::merge::{KeepFirst, VoidMerge};
 pub use self::merge::VoidMerge;
 
+
+const BLOCK_LEN: usize = 256_000;
 const END_CODE: u8 = 0u8;
 const VINT_MODE: u8 = 1u8;
 
@@ -32,6 +36,7 @@ pub trait SSTable: Sized {
 
     fn delta_writer<W: io::Write>(write: W) -> DeltaWriter<W, Self::Writer> {
         DeltaWriter {
+            block: vec![0u8; 4],
             write: BufWriter::new(write),
             value_writer: Self::Writer::default()
         }
@@ -44,30 +49,30 @@ pub trait SSTable: Sized {
         }
     }
 
-    fn delta_reader<R: io::BufRead>(reader: R) -> DeltaReader<R, Self::Reader> {
+    fn delta_reader<'a, R: io::Read + 'a>(reader: R) -> DeltaReader<'a, Self::Reader> {
         DeltaReader {
             common_prefix_len: 0,
             suffix: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
             value_reader: Self::Reader::default(),
-            reader,
+            block_reader: BlockReader::new(Box::new(reader)),
         }
     }
 
-    fn reader<R: io::BufRead>(reader: R) -> Reader<R, Self::Reader> {
+    fn reader<'a, R: io::Read + 'a>(reader: R) -> Reader<'a, Self::Reader> {
         Reader {
             key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
             delta_reader: Self::delta_reader(reader)
         }
     }
 
-    fn merge<R: io::BufRead, W: io::Write, M: ValueMerger<Self::Value>>(io_readers: Vec<R>, w: W, merger: M) -> io::Result<()> {
+    fn merge<R: io::Read, W: io::Write, M: ValueMerger<Self::Value>>(io_readers: Vec<R>, w: W, merger: M) -> io::Result<()> {
         let mut readers = vec![];
         for io_reader in io_readers.into_iter() {
             let reader = Self::reader(io_reader);
             readers.push(reader)
         }
         let writer = Self::writer(w);
-        merge::merge_sstable::<Self, _, _, _>(readers, writer, merger)
+        merge::merge_sstable::<Self, _, _>(readers, writer, merger)
     }
 }
 
@@ -77,30 +82,67 @@ impl SSTable for VoidSSTable {
     type Value = ();
     type Reader = value::VoidReader;
     type Writer = value::VoidWriter;
-
-
 }
 
-fn pop_byte<R: io::BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
-    let b: u8 = {
-        let available_data = reader.fill_buf()?;
-        if available_data.is_empty() {
-            return Ok(None);
-        }
-        available_data[0]
-    };
-    reader.consume(1);
-    Ok(Some(b))
-}
 
-pub struct Reader<R, TValueReader> {
+pub struct Reader<'a, TValueReader> {
     key: Vec<u8>,
-    delta_reader: DeltaReader<R, TValueReader>,
-
+    delta_reader: DeltaReader<'a, TValueReader>,
 }
 
-impl<R,TValueReader> Reader<R,TValueReader>
-    where R: io::BufRead, TValueReader: value::ValueReader {
+pub struct BlockReader<'a> {
+    buffer: Vec<u8>,
+    offset: usize,
+    reader: Box<io::Read + 'a>
+}
+
+
+impl<'a> BlockReader<'a> {
+
+    pub fn new(reader: Box<io::Read + 'a>) -> BlockReader<'a> {
+        BlockReader {
+            buffer: Vec::with_capacity(BLOCK_LEN),
+            offset: 0,
+            reader
+        }
+    }
+
+    pub fn read_byte(&mut self) -> u8 {
+        let res = self.buffer()[0];
+        self.consume(1);
+        res
+    }
+
+    fn read_exact(&mut self, buffer: &mut [u8]) {
+        let len_buffer = buffer.len();
+        buffer.copy_from_slice(&self.buffer()[..len_buffer]);
+        self.consume(len_buffer);
+    }
+
+    fn read_block(&mut self) -> io::Result<bool> {
+        let block_len = self.reader.read_u32::<LittleEndian>()?;
+        if block_len == 0u32 {
+            self.buffer.clear();
+            Ok(false)
+        } else {
+            self.offset = 0;
+            self.buffer.resize(block_len as usize, 0u8);
+            self.reader.read_exact(&mut self.buffer[..])?;
+            Ok(true)
+        }
+    }
+
+    fn consume(&mut self, offset: usize) {
+        self.offset += offset;
+    }
+
+    fn buffer(&self) -> &[u8] {
+        &self.buffer[self.offset..]
+    }
+}
+
+impl<'a, TValueReader> Reader<'a, TValueReader>
+    where TValueReader: value::ValueReader {
 
     pub fn advance(&mut self) -> io::Result<bool> {
         if self.delta_reader.advance()? {
@@ -124,33 +166,33 @@ impl<R,TValueReader> Reader<R,TValueReader>
         self.delta_reader.value()
     }
 
-    pub(crate) fn into_delta_reader(self) -> DeltaReader<R, TValueReader> {
+    pub(crate) fn into_delta_reader(self) -> DeltaReader<'a, TValueReader> {
         assert!(self.key.is_empty());
         self.delta_reader
     }
 }
 
 
-pub(crate) fn read_keep_add<R: io::BufRead>(reader: &mut R) -> io::Result<Option<(usize, usize)>> {
-    match pop_byte(reader)? {
-        None | Some(END_CODE) => {
-            Ok(None)
+pub(crate) fn read_keep_add(reader: &mut BlockReader) -> Option<(usize, usize)> {
+    match reader.read_byte() {
+        END_CODE => {
+            None
         }
-        Some(VINT_MODE) => {
-            let keep = vint::deserialize_read(reader)? as usize;
-            let add = vint::deserialize_read(reader)? as usize;
-            Ok(Some((keep, add)))
+        VINT_MODE => {
+            let keep = vint::deserialize_read(reader) as usize;
+            let add = vint::deserialize_read(reader) as usize;
+            Some((keep, add))
         }
-        Some(b) => {
+        b => {
             let keep = (b & 0b1111) as usize;
             let add = (b >> 4) as usize;
-            Ok(Some((keep, add)))
+            Some((keep, add))
         }
     }
 }
 
 
-impl<R,TValueReader> AsRef<[u8]> for Reader<R,TValueReader> {
+impl<'a, TValueReader> AsRef<[u8]> for Reader<'a, TValueReader> {
     fn as_ref(&self) -> &[u8] {
         &self.key
     }
@@ -169,7 +211,7 @@ impl<W, TValueWriter> Writer<W, TValueWriter>
         &self.previous_key[..]
     }
 
-    pub(crate) fn write_key(&mut self, key: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_key(&mut self, key: &[u8]) {
         let keep_len = common_prefix_len(&self.previous_key, key);
         let add_len = key.len() - keep_len;
         let increasing_keys =
@@ -181,8 +223,7 @@ impl<W, TValueWriter> Writer<W, TValueWriter>
         self.previous_key[keep_len..].copy_from_slice(&key[keep_len..]);
         self.delta_writer.write_suffix(
             keep_len,
-            &key[keep_len..])?;
-        Ok(())
+            &key[keep_len..]);
     }
 
     pub(crate) fn into_delta_writer(self) -> DeltaWriter<W, TValueWriter> {
@@ -190,12 +231,13 @@ impl<W, TValueWriter> Writer<W, TValueWriter>
     }
 
     pub fn write(&mut self, key: &[u8], value: &TValueWriter::Value) -> io::Result<()> {
-        self.write_key(key)?;
-        self.write_value(value)?;
+        self.write_key(key);
+        self.write_value(value);
+        self.delta_writer.flush_block_if_required()?;
         Ok(())
     }
 
-    pub(crate) fn write_value(&mut self, value: &TValueWriter::Value) -> io::Result<()> {
+    pub(crate) fn write_value(&mut self, value: &TValueWriter::Value) {
         self.delta_writer.write_value(value)
     }
 
@@ -207,6 +249,7 @@ impl<W, TValueWriter> Writer<W, TValueWriter>
 
 pub struct DeltaWriter<W, TValueWriter>
     where W: io::Write {
+    block: Vec<u8>,
     write: BufWriter<W>,
     value_writer: TValueWriter,
 }
@@ -214,73 +257,92 @@ pub struct DeltaWriter<W, TValueWriter>
 impl<W, TValueWriter> DeltaWriter<W, TValueWriter>
     where W: io::Write, TValueWriter: value::ValueWriter {
 
-    fn encode_keep_add(&mut self, keep_len: usize, add_len: usize) -> io::Result<()> {
+    fn flush_block(&mut self) -> io::Result<()> {
+        let block_len = self.block.len() as u32;
+        LittleEndian::write_u32(&mut self.block[..4], block_len - 4u32);
+        self.write.write_all(&mut self.block[..])?;
+        self.block.resize(4, 0u8);
+        Ok(())
+    }
+
+    fn encode_keep_add(&mut self, keep_len: usize, add_len: usize) {
         if keep_len < FOUR_BIT_LIMITS && add_len < FOUR_BIT_LIMITS {
             let b = (keep_len | add_len << 4) as u8;
-            self.write.write_all(&[b])
+            self.block.extend_from_slice(&[b])
         } else {
             let mut buf = [1u8; 20];
             let mut len = 1 + vint::serialize(keep_len as u64, &mut buf[1..]);
             len += vint::serialize(add_len as u64, &mut buf[len..]);
-            self.write.write_all(&mut buf[..len])
+            self.block.extend_from_slice(&mut buf[..len])
         }
     }
 
-    pub(crate) fn write_suffix(&mut self, common_prefix_len: usize, suffix: &[u8]) -> io::Result<()> {
+    pub(crate) fn write_suffix(&mut self, common_prefix_len: usize, suffix: &[u8]) {
         let keep_len = common_prefix_len;
         let add_len = suffix.len();
-        self.encode_keep_add(keep_len, add_len)?;
-        self.write.write_all(suffix)?;
-        Ok(())
+        self.encode_keep_add(keep_len, add_len);
+        self.block.extend_from_slice(suffix);
     }
 
-    pub(crate) fn write_value(&mut self, value: &TValueWriter::Value) -> io::Result<()> {
-        self.value_writer.write(value, &mut self.write)?;
-        Ok(())
+    pub(crate) fn write_value(&mut self, value: &TValueWriter::Value) {
+        self.value_writer.write(value, &mut self.block);
     }
 
     pub fn write_delta(&mut self, common_prefix_len: usize, suffix: &[u8], value: &TValueWriter::Value) -> io::Result<()> {
-        self.write_suffix(common_prefix_len, suffix)?;
-        self.write_value(value)?;
+        self.write_suffix(common_prefix_len, suffix);
+        self.write_value(value);
+        self.flush_block_if_required()
+    }
+
+    pub fn flush_block_if_required(&mut self) -> io::Result<()> {
+        if self.block.len() > BLOCK_LEN {
+            self.flush_block()?;
+        }
         Ok(())
     }
 
     pub fn finalize(mut self) -> io::Result<()> {
-        self.write.write(&[0u8, 0u8])?;
-        self.write.flush()
+        if self.block.len() > 4 {
+            self.flush_block()?;
+        }
+        self.flush_block()?;
+        Ok(())
     }
 }
 
 
-pub struct DeltaReader<R, TValueReader> {
+pub struct DeltaReader<'a, TValueReader> {
     common_prefix_len: usize,
     suffix: Vec<u8>,
     value_reader: TValueReader,
-    reader: R,
+    block_reader: BlockReader<'a>,
 }
 
-impl<R,TValueReader> DeltaReader<R,TValueReader>
-    where R: io::BufRead, TValueReader: value::ValueReader {
+impl<'a, TValueReader> DeltaReader<'a, TValueReader>
+    where TValueReader: value::ValueReader {
 
-    fn read_delta_key(&mut self) -> io::Result<bool> {
-        if let Some((keep, add)) = read_keep_add(&mut self.reader)? {
+    fn read_delta_key(&mut self) -> bool {
+        if let Some((keep, add)) = read_keep_add(&mut self.block_reader) {
             self.common_prefix_len = keep;
             self.suffix.resize(add, 0u8);
-            self.reader.read_exact(&mut self.suffix[..add])?;
-            Ok(true)
+            self.block_reader.read_exact(&mut self.suffix[..add]);
+            true
         } else {
-            Ok(false)
+            false
         }
     }
 
     pub fn advance(&mut self) -> io::Result<bool> {
-        if self.read_delta_key()? {
-            self.value_reader.read(&mut self.reader)?;
-            Ok(true)
-        } else {
-            Ok(false)
+        if self.block_reader.buffer().is_empty() {
+            if !self.block_reader.read_block()? {
+                return Ok(false);
+            }
         }
-
+        if !self.read_delta_key() {
+            return Ok(false);
+        }
+        self.value_reader.read(&mut self.block_reader)?;
+        Ok(true)
     }
 
     pub fn common_prefix_len(&self) -> usize {
@@ -355,10 +417,11 @@ mod tests {
             assert!(sstable_writer.finalize().is_ok());
         }
         assert_eq!(&buffer, &[
+            7,0,0,0,
             16u8, 17u8,
             33u8, 18u8, 19u8,
             17u8, 20u8,
-            0u8, 0u8]);
+            0u8, 0u8, 0u8, 0u8]);
         let mut sstable_reader = VoidSSTable::reader(&buffer[..]);
         assert!(sstable_reader.advance().unwrap());
         assert_eq!(sstable_reader.key(), &[17u8]);

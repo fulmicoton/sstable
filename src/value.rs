@@ -1,4 +1,5 @@
 use std::io;
+use BlockReader;
 
 pub trait ValueReader: Default {
 
@@ -6,14 +7,14 @@ pub trait ValueReader: Default {
 
     fn value(&self) -> &Self::Value;
 
-    fn read<R: io::BufRead>(&mut self, reader: &mut R) -> io::Result<()>;
+    fn read(&mut self, reader: &mut BlockReader) -> io::Result<()>;
 }
 
 pub trait ValueWriter: Default {
 
     type Value;
 
-    fn write<W: io::Write>(&mut self, val: &Self::Value, writer: &mut W) -> io::Result<()>;
+    fn write(&mut self, val: &Self::Value, writer: &mut Vec<u8>);
 }
 
 
@@ -27,7 +28,7 @@ impl ValueReader for VoidReader {
         &()
     }
 
-    fn read<R: io::BufRead>(&mut self, _reader: &mut R) -> io::Result<()> {
+    fn read(&mut self, _reader: &mut BlockReader) -> io::Result<()> {
         Ok(())
     }
 }
@@ -38,7 +39,5 @@ pub struct VoidWriter;
 impl ValueWriter for VoidWriter {
     type Value = ();
 
-    fn write<W: io::Write>(&mut self, _: &Self::Value, _: &mut W) -> Result<(), io::Error> {
-        Ok(())
-    }
+    fn write(&mut self, _: &Self::Value, _: &mut Vec<u8>) {}
 }

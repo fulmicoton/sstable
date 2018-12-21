@@ -131,8 +131,8 @@ impl Queue {
     }
 }
 
-pub fn merge_sstable<SST: SSTable, R: io::BufRead, W: io::Write, M: ValueMerger<SST::Value>>(
-    unstarted_readers: Vec<Reader<R, SST::Reader>>,
+pub fn merge_sstable<SST: SSTable, W: io::Write, M: ValueMerger<SST::Value>>(
+    unstarted_readers: Vec<Reader<SST::Reader>>,
     writer: Writer<W, SST::Writer>,
     mut merger: M
 ) -> io::Result<()> {
