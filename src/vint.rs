@@ -1,5 +1,3 @@
-use BlockReader;
-
 const CONTINUE_BIT: u8 = 128u8;
 
 pub fn serialize(mut val: u64, buffer: &mut [u8]) -> usize {
@@ -17,12 +15,12 @@ pub fn serialize(mut val: u64, buffer: &mut [u8]) -> usize {
 }
 
 // super slow but we don't care
-pub fn deserialize_read(block_reader: &mut BlockReader) -> u64 {
+pub fn deserialize_read(buf: &[u8]) -> (usize, u64) {
     let mut result = 0u64;
     let mut shift = 0u64;
     let mut consumed = 0;
 
-    for &b in block_reader.buffer() {
+    for &b in buf {
         consumed += 1;
         result |= u64::from(b % 128u8) << shift;
         if b < CONTINUE_BIT {
@@ -30,8 +28,7 @@ pub fn deserialize_read(block_reader: &mut BlockReader) -> u64 {
         }
         shift += 7;
     }
-    block_reader.consume(consumed);
-    result
+    (consumed, result)
 }
 
 
@@ -40,18 +37,11 @@ mod tests {
     use vint::serialize;
     use vint::deserialize_read;
     use std::u64;
-    use BlockReader;
-    use byteorder::{ByteOrder, LittleEndian};
 
     fn aux_test_int(val: u64, expect_len: usize) {
         let mut buffer = [0u8; 14];
-        LittleEndian::write_u32(&mut buffer[..4], 10);
-        assert_eq!(serialize(val, &mut buffer[4..]), expect_len);
-        let r: &[u8] = &mut &buffer[..];
-        let mut block_reader = BlockReader::new(Box::new(r));
-        assert!(block_reader.read_block().unwrap());
-        assert_eq!(deserialize_read(&mut block_reader), val);
-        assert_eq!(expect_len + block_reader.buffer().len() + 4, buffer.len());
+        assert_eq!(serialize(val, &mut buffer[..]), expect_len);
+        assert_eq!(deserialize_read(&buffer), (expect_len, val));
     }
 
     #[test]

@@ -4,13 +4,15 @@ extern crate byteorder;
 
 use std::io::{self, Write, BufWriter};
 use merge::ValueMerger;
-use byteorder::{ByteOrder, LittleEndian, ReadBytesExt};
+use byteorder::{ByteOrder, LittleEndian};
 
 pub(crate) mod vint;
 pub mod value;
 pub mod merge;
+mod block_reader;
 
-//pub use self::merge::{KeepFirst, VoidMerge};
+pub use self::block_reader::BlockReader;
+
 pub use self::merge::VoidMerge;
 
 
@@ -52,7 +54,9 @@ pub trait SSTable: Sized {
     fn delta_reader<'a, R: io::Read + 'a>(reader: R) -> DeltaReader<'a, Self::Reader> {
         DeltaReader {
             common_prefix_len: 0,
-            suffix: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
+            suffix_start: 0,
+            suffix_end: 0,
+            offset: 0,
             value_reader: Self::Reader::default(),
             block_reader: BlockReader::new(Box::new(reader)),
         }
@@ -90,57 +94,6 @@ pub struct Reader<'a, TValueReader> {
     delta_reader: DeltaReader<'a, TValueReader>,
 }
 
-pub struct BlockReader<'a> {
-    buffer: Vec<u8>,
-    offset: usize,
-    reader: Box<io::Read + 'a>
-}
-
-
-impl<'a> BlockReader<'a> {
-
-    pub fn new(reader: Box<io::Read + 'a>) -> BlockReader<'a> {
-        BlockReader {
-            buffer: Vec::with_capacity(BLOCK_LEN),
-            offset: 0,
-            reader
-        }
-    }
-
-    pub fn read_byte(&mut self) -> u8 {
-        let res = self.buffer()[0];
-        self.consume(1);
-        res
-    }
-
-    fn read_exact(&mut self, buffer: &mut [u8]) {
-        let len_buffer = buffer.len();
-        buffer.copy_from_slice(&self.buffer()[..len_buffer]);
-        self.consume(len_buffer);
-    }
-
-    fn read_block(&mut self) -> io::Result<bool> {
-        let block_len = self.reader.read_u32::<LittleEndian>()?;
-        if block_len == 0u32 {
-            self.buffer.clear();
-            Ok(false)
-        } else {
-            self.offset = 0;
-            self.buffer.resize(block_len as usize, 0u8);
-            self.reader.read_exact(&mut self.buffer[..])?;
-            Ok(true)
-        }
-    }
-
-    fn consume(&mut self, offset: usize) {
-        self.offset += offset;
-    }
-
-    fn buffer(&self) -> &[u8] {
-        &self.buffer[self.offset..]
-    }
-}
-
 impl<'a, TValueReader> Reader<'a, TValueReader>
     where TValueReader: value::ValueReader {
 
@@ -173,23 +126,6 @@ impl<'a, TValueReader> Reader<'a, TValueReader>
 }
 
 
-pub(crate) fn read_keep_add(reader: &mut BlockReader) -> Option<(usize, usize)> {
-    match reader.read_byte() {
-        END_CODE => {
-            None
-        }
-        VINT_MODE => {
-            let keep = vint::deserialize_read(reader) as usize;
-            let add = vint::deserialize_read(reader) as usize;
-            Some((keep, add))
-        }
-        b => {
-            let keep = (b & 0b1111) as usize;
-            let add = (b >> 4) as usize;
-            Some((keep, add))
-        }
-    }
-}
 
 
 impl<'a, TValueReader> AsRef<[u8]> for Reader<'a, TValueReader> {
@@ -313,7 +249,9 @@ impl<W, TValueWriter> DeltaWriter<W, TValueWriter>
 
 pub struct DeltaReader<'a, TValueReader> {
     common_prefix_len: usize,
-    suffix: Vec<u8>,
+    suffix_start: usize,
+    suffix_end: usize,
+    offset: usize,
     value_reader: TValueReader,
     block_reader: BlockReader<'a>,
 }
@@ -321,16 +259,51 @@ pub struct DeltaReader<'a, TValueReader> {
 impl<'a, TValueReader> DeltaReader<'a, TValueReader>
     where TValueReader: value::ValueReader {
 
+    fn deserialize_vint(&mut self) -> u64 {
+        let (consumed, result) =
+            vint::deserialize_read(&self.block_reader.buffer()[self.offset..]);
+        self.offset += consumed;
+        result
+    }
+
+    fn read_keep_add(&mut self) -> Option<(usize, usize)> {
+        let b = {
+            let buf = &self.block_reader.buffer()[self.offset..];
+            if buf.is_empty() {
+                return None;
+            }
+            buf[0]
+        };
+        self.offset += 1;
+        match b {
+            END_CODE => {
+                None
+            }
+            VINT_MODE => {
+                let keep = self.deserialize_vint() as usize;
+                let add = self.deserialize_vint() as usize;
+                Some((keep, add))
+            }
+            b => {
+                let keep = (b & 0b1111) as usize;
+                let add = (b >> 4) as usize;
+                Some((keep, add))
+            }
+        }
+    }
+
     fn read_delta_key(&mut self) -> bool {
-        if let Some((keep, add)) = read_keep_add(&mut self.block_reader) {
+        if let Some((keep, add)) = self.read_keep_add() {
             self.common_prefix_len = keep;
-            self.suffix.resize(add, 0u8);
-            self.block_reader.read_exact(&mut self.suffix[..add]);
+            self.suffix_start = self.offset;
+            self.suffix_end = self.suffix_start + add;
+            self.offset += add;
             true
         } else {
             false
         }
     }
+
 
     pub fn advance(&mut self) -> io::Result<bool> {
         if self.block_reader.buffer().is_empty() {
@@ -350,11 +323,11 @@ impl<'a, TValueReader> DeltaReader<'a, TValueReader>
     }
 
     pub fn suffix(&self) -> &[u8] {
-        &self.suffix
+        &self.block_reader.buffer()[self.suffix_start..self.suffix_end]
     }
 
     pub fn suffix_from(&self, offset: usize) -> &[u8] {
-        &self.suffix[offset - self.common_prefix_len..]
+        &self.block_reader.buffer()[self.suffix_start + offset..self.suffix_end]
     }
 
     pub fn value(&self) -> &TValueReader::Value {

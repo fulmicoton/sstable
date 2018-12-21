@@ -1,9 +1,3 @@
-
-
-
-
-
-
 use {SSTable, Reader};
 use std::io;
 use merge::{ValueMerger, SingleValueMerger};
@@ -15,7 +9,6 @@ use std::option::Option::None;
 use std::collections::HashMap;
 use std::mem;
 use common_prefix_len;
-
 
 fn pick_lowest_with_ties<'a, 'b, T, FnKey: Fn(&'b T)->K, K>(elements: &'b [T], key: FnKey, ids: &'a mut [usize]) -> (&'a [usize], &'a [usize])
     where
@@ -49,10 +42,9 @@ fn pick_lowest_with_ties<'a, 'b, T, FnKey: Fn(&'b T)->K, K>(elements: &'b [T], k
 
 #[derive(Clone, Copy, Hash, Debug)]
 struct HeapItem {
-    common_prefix_len: usize,
-    next_byte: u8
+    common_prefix_len: u32,
+    next_byte: u8,
 }
-
 impl Eq for HeapItem {}
 
 impl PartialEq for HeapItem {
@@ -80,7 +72,6 @@ struct Queue {
     spares: Vec<Vec<usize>>,
 }
 
-
 impl Queue {
 
     // helper to trick the borrow checker.
@@ -106,7 +97,7 @@ impl Queue {
         }
     }
 
-    pub fn register(&mut self, common_prefix_len: usize, next_byte: u8, idx: usize) {
+    pub fn register(&mut self, common_prefix_len: u32, next_byte: u8, idx: usize) {
         let heap_item = HeapItem {
             common_prefix_len,
             next_byte,
@@ -166,7 +157,7 @@ pub fn merge_sstable<SST: SSTable, W: io::Write, M: ValueMerger<SST::Value>>(
     let mut queue = Queue::with_capacity(readers.len());
 
     for (idx, delta_reader) in readers.iter().enumerate() {
-        queue.register(0, delta_reader.suffix()[0], idx);
+        queue.register(0u32, delta_reader.suffix()[0], idx);
     }
 
     let mut current_ids = Vec::with_capacity(readers.len());
@@ -178,32 +169,32 @@ pub fn merge_sstable<SST: SSTable, W: io::Write, M: ValueMerger<SST::Value>>(
             &mut current_ids[..]);
         {
             let first_reader = &readers[tie_ids[0]];
-            let suffix = first_reader.suffix_from(heap_item.common_prefix_len);
+            let suffix = first_reader.suffix_from(heap_item.common_prefix_len as usize);
             if tie_ids.len() > 1 {
                 let mut single_value_merger = merger.new_value(first_reader.value());
                 for &min_tie_id in &tie_ids[1..] {
                     single_value_merger.add(readers[min_tie_id].value());
                 }
-                delta_writer.write_delta(heap_item.common_prefix_len,
+                delta_writer.write_delta(heap_item.common_prefix_len as usize,
                                          suffix,
                                          &single_value_merger.finish())?;
             } else {
-                delta_writer.write_delta(heap_item.common_prefix_len,
+                delta_writer.write_delta(heap_item.common_prefix_len as usize,
                                          suffix,
                                          first_reader.value())?;
             }
             for &reader_id in others {
                 let reader = &readers[reader_id];
-                let reader_suffix = reader.suffix_from(heap_item.common_prefix_len);
+                let reader_suffix = reader.suffix_from(heap_item.common_prefix_len as usize);
                 let extra_common_prefix_len = common_prefix_len(reader_suffix, suffix);
                 let next_byte = reader_suffix[extra_common_prefix_len];
-                queue.register(heap_item.common_prefix_len + extra_common_prefix_len, next_byte, reader_id)
+                queue.register(heap_item.common_prefix_len + extra_common_prefix_len as u32, next_byte, reader_id)
             }
         }
         for &tie_id in tie_ids {
             let mut reader = &mut readers[tie_id];
             if reader.advance()? {
-                queue.register(reader.common_prefix_len(), reader.suffix()[0], tie_id);
+                queue.register(reader.common_prefix_len() as u32, reader.suffix()[0], tie_id);
             }
         }
     }
