@@ -1,11 +1,12 @@
 extern crate slice_deque;
+extern crate core;
 
 use std::io::{self, Write, BufWriter};
 use merge::ValueMerger;
 
 pub(crate) mod vint;
 pub mod value;
-mod merge;
+pub mod merge;
 
 //pub use self::merge::{KeepFirst, VoidMerge};
 pub use self::merge::VoidMerge;
@@ -16,7 +17,7 @@ const VINT_MODE: u8 = 1u8;
 const DEFAULT_KEY_CAPACITY: usize = 50;
 const FOUR_BIT_LIMITS: usize = 1 << 4;
 
-fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
+pub(crate) fn common_prefix_len(left: &[u8], right: &[u8]) -> usize {
     left.iter().cloned()
         .zip(right.iter().cloned())
         .take_while(|(left, right)| left==right)
@@ -29,29 +30,41 @@ pub trait SSTable: Sized {
     type Reader: value::ValueReader<Value=Self::Value>;
     type Writer: value::ValueWriter<Value=Self::Value>;
 
-    fn writer<W: io::Write>(writer: W) -> Writer<W, Self::Writer> {
+    fn delta_writer<W: io::Write>(write: W) -> DeltaWriter<W, Self::Writer> {
+        DeltaWriter {
+            write: BufWriter::new(write),
+            value_writer: Self::Writer::default()
+        }
+    }
+
+    fn writer<W: io::Write>(write: W) -> Writer<W, Self::Writer> {
         Writer {
             previous_key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
-            write: BufWriter::new(writer),
-            value_writer: Self::Writer::default()
+            delta_writer: Self::delta_writer(write)
+        }
+    }
+
+    fn delta_reader<R: io::BufRead>(reader: R) -> DeltaReader<R, Self::Reader> {
+        DeltaReader {
+            common_prefix_len: 0,
+            suffix: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
+            value_reader: Self::Reader::default(),
+            reader,
         }
     }
 
     fn reader<R: io::BufRead>(reader: R) -> Reader<R, Self::Reader> {
         Reader {
             key: Vec::with_capacity(DEFAULT_KEY_CAPACITY),
-            value_reader: Self::Reader::default(),
-            reader,
+            delta_reader: Self::delta_reader(reader)
         }
     }
 
     fn merge<R: io::BufRead, W: io::Write, M: ValueMerger<Self::Value>>(io_readers: Vec<R>, w: W, merger: M) -> io::Result<()> {
         let mut readers = vec![];
         for io_reader in io_readers.into_iter() {
-            let mut reader = Self::reader(io_reader);
-            if reader.advance()? {
-                readers.push(reader)
-            }
+            let reader = Self::reader(io_reader);
+            readers.push(reader)
         }
         let writer = Self::writer(w);
         merge::merge_sstable::<Self, _, _, _>(readers, writer, merger)
@@ -82,26 +95,20 @@ fn pop_byte<R: io::BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
 
 pub struct Reader<R, TValueReader> {
     key: Vec<u8>,
-    value_reader: TValueReader,
-    reader: R,
+    delta_reader: DeltaReader<R, TValueReader>,
+
 }
 
 impl<R,TValueReader> Reader<R,TValueReader>
     where R: io::BufRead, TValueReader: value::ValueReader {
 
-    fn read_key(&mut self) -> io::Result<bool> {
-        if let Some((keep, add)) = read_keep_add(&mut self.reader)? {
-            self.key.resize(keep + add, 0u8);
-            self.reader.read_exact(&mut self.key[keep..])?;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    }
-
     pub fn advance(&mut self) -> io::Result<bool> {
-        if self.read_key()? {
-            self.value_reader.read(&mut self.reader)?;
+        if self.delta_reader.advance()? {
+            let common_prefix_len = self.delta_reader.common_prefix_len();
+            let suffix = self.delta_reader.suffix();
+            let new_len = self.delta_reader.common_prefix_len() + suffix.len();
+            self.key.resize(new_len, 0u8);
+            self.key[common_prefix_len..].copy_from_slice(suffix);
             Ok(true)
         } else {
             Ok(false)
@@ -114,7 +121,12 @@ impl<R,TValueReader> Reader<R,TValueReader>
     }
 
     pub fn value(&self) -> &TValueReader::Value {
-        self.value_reader.value()
+        self.delta_reader.value()
+    }
+
+    pub(crate) fn into_delta_reader(self) -> DeltaReader<R, TValueReader> {
+        assert!(self.key.is_empty());
+        self.delta_reader
     }
 }
 
@@ -147,11 +159,59 @@ impl<R,TValueReader> AsRef<[u8]> for Reader<R,TValueReader> {
 pub struct Writer<W, TValueWriter>
     where W: io::Write {
     previous_key: Vec<u8>,
+    delta_writer: DeltaWriter<W, TValueWriter>,
+}
+
+impl<W, TValueWriter> Writer<W, TValueWriter>
+    where W: io::Write, TValueWriter: value::ValueWriter {
+
+    pub(crate) fn current_key(&self) -> &[u8] {
+        &self.previous_key[..]
+    }
+
+    pub(crate) fn write_key(&mut self, key: &[u8]) -> io::Result<()> {
+        let keep_len = common_prefix_len(&self.previous_key, key);
+        let add_len = key.len() - keep_len;
+        let increasing_keys =
+            add_len > 0 &&
+                (self.previous_key.len() == keep_len ||
+                    self.previous_key[keep_len] < key[keep_len]);
+        assert!(increasing_keys, "Keys should be increasing. ({:?} > {:?})", self.previous_key, key);
+        self.previous_key.resize(key.len(), 0u8);
+        self.previous_key[keep_len..].copy_from_slice(&key[keep_len..]);
+        self.delta_writer.write_suffix(
+            keep_len,
+            &key[keep_len..])?;
+        Ok(())
+    }
+
+    pub(crate) fn into_delta_writer(self) -> DeltaWriter<W, TValueWriter> {
+        self.delta_writer
+    }
+
+    pub fn write(&mut self, key: &[u8], value: &TValueWriter::Value) -> io::Result<()> {
+        self.write_key(key)?;
+        self.write_value(value)?;
+        Ok(())
+    }
+
+    pub(crate) fn write_value(&mut self, value: &TValueWriter::Value) -> io::Result<()> {
+        self.delta_writer.write_value(value)
+    }
+
+    pub fn finalize(self) -> io::Result<()> {
+        self.delta_writer.finalize()
+    }
+}
+
+
+pub struct DeltaWriter<W, TValueWriter>
+    where W: io::Write {
     write: BufWriter<W>,
     value_writer: TValueWriter,
 }
 
-impl<W, TValueWriter> Writer<W, TValueWriter>
+impl<W, TValueWriter> DeltaWriter<W, TValueWriter>
     where W: io::Write, TValueWriter: value::ValueWriter {
 
     fn encode_keep_add(&mut self, keep_len: usize, add_len: usize) -> io::Result<()> {
@@ -166,23 +226,11 @@ impl<W, TValueWriter> Writer<W, TValueWriter>
         }
     }
 
-    pub(crate) fn current_key(&self) -> &[u8] {
-        &self.previous_key[..]
-    }
-
-    pub(crate) fn write_key(&mut self, key: &[u8]) -> io::Result<()> {
-        let keep_len = common_prefix_len(&self.previous_key, key);
-        let add_len = key.len() - keep_len;
-        let increasing_keys =
-        add_len > 0 &&
-        (self.previous_key.len() == keep_len ||
-        self.previous_key[keep_len] < key[keep_len]);
-        assert!(increasing_keys, "Keys should be increasing. ({:?} > {:?})", self.previous_key, key);
-        let extension = &key[keep_len..];
-        self.previous_key.resize(keep_len, 0u8);
-        self.previous_key.extend_from_slice(extension);
+    pub(crate) fn write_suffix(&mut self, common_prefix_len: usize, suffix: &[u8]) -> io::Result<()> {
+        let keep_len = common_prefix_len;
+        let add_len = suffix.len();
         self.encode_keep_add(keep_len, add_len)?;
-        self.write.write_all(extension)?;
+        self.write.write_all(suffix)?;
         Ok(())
     }
 
@@ -191,8 +239,8 @@ impl<W, TValueWriter> Writer<W, TValueWriter>
         Ok(())
     }
 
-    pub fn write(&mut self, key: &[u8], value: &TValueWriter::Value) -> io::Result<()> {
-        self.write_key(key)?;
+    pub fn write_delta(&mut self, common_prefix_len: usize, suffix: &[u8], value: &TValueWriter::Value) -> io::Result<()> {
+        self.write_suffix(common_prefix_len, suffix)?;
         self.write_value(value)?;
         Ok(())
     }
@@ -202,6 +250,56 @@ impl<W, TValueWriter> Writer<W, TValueWriter>
         self.write.flush()
     }
 }
+
+
+pub struct DeltaReader<R, TValueReader> {
+    common_prefix_len: usize,
+    suffix: Vec<u8>,
+    value_reader: TValueReader,
+    reader: R,
+}
+
+impl<R,TValueReader> DeltaReader<R,TValueReader>
+    where R: io::BufRead, TValueReader: value::ValueReader {
+
+    fn read_delta_key(&mut self) -> io::Result<bool> {
+        if let Some((keep, add)) = read_keep_add(&mut self.reader)? {
+            self.common_prefix_len = keep;
+            self.suffix.resize(add, 0u8);
+            self.reader.read_exact(&mut self.suffix[..add])?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    pub fn advance(&mut self) -> io::Result<bool> {
+        if self.read_delta_key()? {
+            self.value_reader.read(&mut self.reader)?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+
+    }
+
+    pub fn common_prefix_len(&self) -> usize {
+        self.common_prefix_len
+    }
+
+    pub fn suffix(&self) -> &[u8] {
+        &self.suffix
+    }
+
+    pub fn suffix_from(&self, offset: usize) -> &[u8] {
+        &self.suffix[offset - self.common_prefix_len..]
+    }
+
+    pub fn value(&self) -> &TValueReader::Value {
+        self.value_reader.value()
+    }
+}
+
 
 
 #[cfg(test)]
