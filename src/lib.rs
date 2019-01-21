@@ -327,7 +327,7 @@ impl<'a, TValueReader> DeltaReader<'a, TValueReader>
     }
 
     pub fn suffix_from(&self, offset: usize) -> &[u8] {
-        &self.block_reader.buffer()[self.suffix_start + offset..self.suffix_end]
+        &self.block_reader.buffer()[self.suffix_start + offset - self.common_prefix_len..self.suffix_end]
     }
 
     pub fn value(&self) -> &TValueReader::Value {
@@ -336,12 +336,16 @@ impl<'a, TValueReader> DeltaReader<'a, TValueReader>
 }
 
 
+//#[cfg(test)]
+//mod tests;
 
 #[cfg(test)]
-mod tests {
+mod test {
     use common_prefix_len;
     use super::VoidSSTable;
     use super::SSTable;
+    use VoidMerge;
+    use std::io::{Read, Write};
 
     fn aux_test_common_prefix_len(left: &str, right: &str, expect_len: usize) {
         assert_eq!(common_prefix_len(left.as_bytes(), right.as_bytes()), expect_len);
@@ -413,6 +417,20 @@ mod tests {
         let mut sstable_writer = VoidSSTable::writer(&mut buffer);
         assert!(sstable_writer.write(&[17u8], &()).is_ok());
         assert!(sstable_writer.write(&[16u8], &()).is_ok());
+    }
+
+    #[test]
+    fn test_merge_abcd_abe() {
+        let mut buffer = Vec::new();
+        {
+            let mut writer = VoidSSTable::writer(&mut buffer);
+            writer.write(b"abcd", &());
+            writer.write(b"abe", &());
+            writer.finalize();
+        }
+        let mut output = Vec::new();
+        assert!(VoidSSTable::merge(vec![&buffer[..], &buffer[..]], &mut output, VoidMerge).is_ok());
+        assert_eq!(&output[..], &buffer[..]);
     }
 
 }

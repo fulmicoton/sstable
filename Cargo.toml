@@ -6,3 +6,12 @@ authors = ["Paul Masurel <paul.masurel@gmail.com>"]
 [dependencies]
 slice-deque="0.1"
 byteorder = "1.2"
+fnv = "1"
+
+[[bench]]
+name = "merge_benchmark"
+harness = false
+
+[dev-dependencies]
+criterion = "0.2"
+rand = "0.6"

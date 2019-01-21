@@ -6,14 +6,18 @@ use std::collections::BinaryHeap;
 use std::cmp::Ordering;
 use std::cmp::Ord;
 use std::option::Option::None;
-use std::collections::HashMap;
 use std::mem;
+use std::fmt::Debug;
 use common_prefix_len;
+extern crate fnv;
+use self::fnv::FnvHashMap;
+use std::hash::Hash;
+use std::hash::Hasher;
 
 fn pick_lowest_with_ties<'a, 'b, T, FnKey: Fn(&'b T)->K, K>(elements: &'b [T], key: FnKey, ids: &'a mut [usize]) -> (&'a [usize], &'a [usize])
     where
         FnKey: Fn(&'b T)->K,
-        K: Ord + 'b {
+        K: Ord + Debug + 'b {
     debug_assert!(!ids.is_empty());
     if ids.len() <= 1 {
         return (ids, &[]);
@@ -40,11 +44,18 @@ fn pick_lowest_with_ties<'a, 'b, T, FnKey: Fn(&'b T)->K, K>(elements: &'b [T], k
 }
 
 
-#[derive(Clone, Copy, Hash, Debug)]
+#[derive(Clone, Copy, Debug)]
 struct HeapItem {
     common_prefix_len: u32,
     next_byte: u8,
 }
+
+impl Hash for HeapItem {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u32(self.common_prefix_len | (self.next_byte as u32) << 24);
+    }
+}
+
 impl Eq for HeapItem {}
 
 impl PartialEq for HeapItem {
@@ -68,16 +79,17 @@ impl Ord for HeapItem {
 
 struct Queue {
     queue: BinaryHeap<HeapItem>,
-    map: HashMap<HeapItem, Vec<usize>>,
+    map: FnvHashMap<HeapItem, Vec<usize>>,
     spares: Vec<Vec<usize>>,
 }
 
 impl Queue {
 
     // helper to trick the borrow checker.
-    fn push_to_queue(heap_item: HeapItem, idx: usize,
+    fn push_to_queue(heap_item: HeapItem,
+                     idx: usize,
                      queue: &mut BinaryHeap<HeapItem>,
-                     map: &mut HashMap<HeapItem, Vec<usize>>,
+                     map: &mut FnvHashMap<HeapItem, Vec<usize>>,
                      spares: &mut Vec<Vec<usize>>) {
         map.entry(heap_item)
             .or_insert_with(|| {
@@ -92,7 +104,7 @@ impl Queue {
     pub fn with_capacity(capacity: usize) -> Self {
         Queue {
             queue: BinaryHeap::with_capacity(capacity),
-            map: HashMap::with_capacity(capacity),
+            map: FnvHashMap::with_capacity_and_hasher(capacity * 5, Default::default()),
             spares: (0..capacity).map(|_| Vec::with_capacity(capacity)).collect()
         }
     }
@@ -107,18 +119,13 @@ impl Queue {
 
     pub fn pop(&mut self, dest: &mut Vec<usize>) -> Option<HeapItem> {
         dest.clear();
-        if let Some(heap_item) = self.queue.pop() {
-            if let Some(mut idxs) = self.map.remove(&heap_item) {
-                mem::swap(dest, &mut idxs);
-                self.spares.push(idxs);
-                Some(heap_item)
-            } else {
-                unreachable!();
-            }
-        } else {
-            None
-        }
-
+        self.queue
+            .pop()
+            .map(|heap_item| {
+                let mut idxs = self.map.remove(&heap_item).unwrap();
+                self.spares.push(mem::replace(dest, idxs));
+                heap_item
+        })
     }
 }
 
@@ -165,7 +172,7 @@ pub fn merge_sstable<SST: SSTable, W: io::Write, M: ValueMerger<SST::Value>>(
         debug_assert!(!current_ids.is_empty());
         let (tie_ids, others) = pick_lowest_with_ties(
             &readers[..],
-            |reader| reader.suffix(),
+            |reader| reader.suffix_from(heap_item.common_prefix_len as usize),
             &mut current_ids[..]);
         {
             let first_reader = &readers[tie_ids[0]];
@@ -198,6 +205,7 @@ pub fn merge_sstable<SST: SSTable, W: io::Write, M: ValueMerger<SST::Value>>(
             }
         }
     }
+    delta_writer.finalize()?;
     Ok(())
 }
 

@@ -91,12 +91,6 @@ mod tests {
         }
         let mut w = Vec::new();
         assert!(VoidSSTable::merge(sstables_ref, &mut w, VoidMerge).is_ok());
-//        let mut reader = VoidSSTable::reader(&w[..]);
-//        for s in merged {
-//            assert!(reader.advance().unwrap());
-//            assert_eq!(s.as_bytes(), reader.key());
-//        }
-//        assert!(!reader.advance().unwrap());
     }
 
     #[test]
