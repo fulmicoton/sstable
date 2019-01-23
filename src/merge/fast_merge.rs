@@ -9,10 +9,6 @@ use std::option::Option::None;
 use std::mem;
 use std::fmt::Debug;
 use common_prefix_len;
-extern crate fnv;
-use self::fnv::FnvHashMap;
-use std::hash::Hash;
-use std::hash::Hasher;
 
 fn pick_lowest_with_ties<'a, 'b, T, FnKey: Fn(&'b T)->K, K>(elements: &'b [T], key: FnKey, ids: &'a mut [usize]) -> (&'a [usize], &'a [usize])
     where
@@ -45,42 +41,27 @@ fn pick_lowest_with_ties<'a, 'b, T, FnKey: Fn(&'b T)->K, K>(elements: &'b [T], k
 
 
 #[derive(Clone, Copy, Debug)]
-struct HeapItem {
-    common_prefix_len: u32,
-    next_byte: u8,
-}
+struct HeapItem(pub u32);
 
-impl Hash for HeapItem {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u32(self.common_prefix_len | (self.next_byte as u32) << 24);
+impl HeapItem  {
+    fn new(common_prefix_len: u32, next_byte: u8) -> Self {
+        HeapItem(common_prefix_len << 8 | (next_byte as u32))
     }
-}
 
-impl Eq for HeapItem {}
-
-impl PartialEq for HeapItem {
-    fn eq(&self, other: &Self) -> bool {
-        self.cmp(&other) == Ordering::Equal
-    }
-}
-
-impl PartialOrd for HeapItem {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl Ord for HeapItem {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.common_prefix_len.cmp(&other.common_prefix_len)
-            .then(other.next_byte.cmp(&self.next_byte))
+    fn common_prefix_len(&self) -> usize {
+        self.0 as usize >> 8
     }
 }
 
 struct Queue {
-    queue: BinaryHeap<HeapItem>,
-    map: FnvHashMap<HeapItem, Vec<usize>>,
+    queue: BinaryHeap<u32>,
+    map: Vec<Vec<usize>>,
     spares: Vec<Vec<usize>>,
+}
+
+
+fn heap_item_to_id(heap_item: &HeapItem) -> usize {
+    heap_item.0 as usize
 }
 
 impl Queue {
@@ -88,32 +69,28 @@ impl Queue {
     // helper to trick the borrow checker.
     fn push_to_queue(heap_item: HeapItem,
                      idx: usize,
-                     queue: &mut BinaryHeap<HeapItem>,
-                     map: &mut FnvHashMap<HeapItem, Vec<usize>>,
+                     queue: &mut BinaryHeap<u32>,
+                     map: &mut Vec<Vec<usize>>,
                      spares: &mut Vec<Vec<usize>>) {
-        map.entry(heap_item)
-            .or_insert_with(|| {
-                queue.push(heap_item);
-                let mut el = spares.pop().expect("Spares should never be empty");
-                el.clear();
-                el
-            })
-            .push(idx);
+        let heap_id = heap_item_to_id(&heap_item);
+        let ids = &mut map[heap_id];
+        if ids.is_empty() {
+            queue.push(heap_item.0);
+            mem::replace(ids, spares.pop().unwrap());
+        }
+        ids.push(idx);
     }
 
     pub fn with_capacity(capacity: usize) -> Self {
         Queue {
             queue: BinaryHeap::with_capacity(capacity),
-            map: FnvHashMap::with_capacity_and_hasher(capacity * 5, Default::default()),
+            map: (0..256 * 100).map(|_| Vec::new()).collect::<Vec<Vec<usize>>>(),
             spares: (0..capacity).map(|_| Vec::with_capacity(capacity)).collect()
         }
     }
 
     pub fn register(&mut self, common_prefix_len: u32, next_byte: u8, idx: usize) {
-        let heap_item = HeapItem {
-            common_prefix_len,
-            next_byte,
-        };
+        let heap_item = HeapItem::new(common_prefix_len, next_byte);
         Queue::push_to_queue(heap_item, idx, &mut self.queue, &mut self.map, &mut self.spares);
     }
 
@@ -122,9 +99,10 @@ impl Queue {
         self.queue
             .pop()
             .map(|heap_item| {
-                let mut idxs = self.map.remove(&heap_item).unwrap();
-                self.spares.push(mem::replace(dest, idxs));
-                heap_item
+                dest.clear();
+                let idx = mem::replace(&mut self.map[heap_item as usize], Vec::new());
+                self.spares.push(mem::replace(dest,idx));
+                HeapItem(heap_item)
         })
     }
 }
@@ -172,30 +150,30 @@ pub fn merge_sstable<SST: SSTable, W: io::Write, M: ValueMerger<SST::Value>>(
         debug_assert!(!current_ids.is_empty());
         let (tie_ids, others) = pick_lowest_with_ties(
             &readers[..],
-            |reader| reader.suffix_from(heap_item.common_prefix_len as usize),
+            |reader| reader.suffix_from(heap_item.common_prefix_len()),
             &mut current_ids[..]);
         {
             let first_reader = &readers[tie_ids[0]];
-            let suffix = first_reader.suffix_from(heap_item.common_prefix_len as usize);
+            let suffix = first_reader.suffix_from(heap_item.common_prefix_len());
             if tie_ids.len() > 1 {
                 let mut single_value_merger = merger.new_value(first_reader.value());
                 for &min_tie_id in &tie_ids[1..] {
                     single_value_merger.add(readers[min_tie_id].value());
                 }
-                delta_writer.write_delta(heap_item.common_prefix_len as usize,
+                delta_writer.write_delta(heap_item.common_prefix_len(),
                                          suffix,
                                          &single_value_merger.finish())?;
             } else {
-                delta_writer.write_delta(heap_item.common_prefix_len as usize,
+                delta_writer.write_delta(heap_item.common_prefix_len(),
                                          suffix,
                                          first_reader.value())?;
             }
             for &reader_id in others {
                 let reader = &readers[reader_id];
-                let reader_suffix = reader.suffix_from(heap_item.common_prefix_len as usize);
+                let reader_suffix = reader.suffix_from(heap_item.common_prefix_len());
                 let extra_common_prefix_len = common_prefix_len(reader_suffix, suffix);
                 let next_byte = reader_suffix[extra_common_prefix_len];
-                queue.register(heap_item.common_prefix_len + extra_common_prefix_len as u32, next_byte, reader_id)
+                queue.register(heap_item.common_prefix_len() as u32 + extra_common_prefix_len as u32, next_byte, reader_id)
             }
         }
         for &tie_id in tie_ids {

@@ -1,3 +1,8 @@
+extern crate jemallocator;
+
+#[global_allocator]
+static ALLOC: jemallocator::Jemalloc = jemallocator::Jemalloc;
+
 extern crate slice_deque;
 extern crate core;
 extern crate byteorder;
@@ -5,6 +10,7 @@ extern crate byteorder;
 use std::io::{self, Write, BufWriter};
 use merge::ValueMerger;
 use byteorder::{ByteOrder, LittleEndian};
+use std::usize;
 
 pub(crate) mod vint;
 pub mod value;
@@ -14,7 +20,6 @@ mod block_reader;
 pub use self::block_reader::BlockReader;
 
 pub use self::merge::VoidMerge;
-
 
 const BLOCK_LEN: usize = 256_000;
 const END_CODE: u8 = 0u8;
@@ -125,14 +130,12 @@ impl<'a, TValueReader> Reader<'a, TValueReader>
     }
 }
 
-
-
-
 impl<'a, TValueReader> AsRef<[u8]> for Reader<'a, TValueReader> {
     fn as_ref(&self) -> &[u8] {
         &self.key
     }
 }
+
 
 pub struct Writer<W, TValueWriter>
     where W: io::Write {
@@ -327,7 +330,7 @@ impl<'a, TValueReader> DeltaReader<'a, TValueReader>
     }
 
     pub fn suffix_from(&self, offset: usize) -> &[u8] {
-        &self.block_reader.buffer()[self.suffix_start + offset - self.common_prefix_len..self.suffix_end]
+        &self.block_reader.buffer()[self.suffix_start.wrapping_add(offset).wrapping_sub(self.common_prefix_len)..self.suffix_end]
     }
 
     pub fn value(&self) -> &TValueReader::Value {
@@ -336,16 +339,12 @@ impl<'a, TValueReader> DeltaReader<'a, TValueReader>
 }
 
 
-//#[cfg(test)]
-//mod tests;
-
 #[cfg(test)]
 mod test {
     use common_prefix_len;
     use super::VoidSSTable;
     use super::SSTable;
     use VoidMerge;
-    use std::io::{Read, Write};
 
     fn aux_test_common_prefix_len(left: &str, right: &str, expect_len: usize) {
         assert_eq!(common_prefix_len(left.as_bytes(), right.as_bytes()), expect_len);
@@ -424,9 +423,9 @@ mod test {
         let mut buffer = Vec::new();
         {
             let mut writer = VoidSSTable::writer(&mut buffer);
-            writer.write(b"abcd", &());
-            writer.write(b"abe", &());
-            writer.finalize();
+            writer.write(b"abcd", &()).unwrap();
+            writer.write(b"abe", &()).unwrap();
+            writer.finalize().unwrap();
         }
         let mut output = Vec::new();
         assert!(VoidSSTable::merge(vec![&buffer[..], &buffer[..]], &mut output, VoidMerge).is_ok());

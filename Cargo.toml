@@ -6,11 +6,21 @@ authors = ["Paul Masurel <paul.masurel@gmail.com>"]
 [dependencies]
 slice-deque="0.1"
 byteorder = "1.2"
-fnv = "1"
+jemallocator = "*"
 
 [[bench]]
 name = "merge_benchmark"
 harness = false
+
+[profile.bench]
+opt-level = 3
+debug = false
+overflow-checks = false
+lto = true
+rpath = false
+debug-assertions = false
+codegen-units = 16
+incremental = false
 
 [dev-dependencies]
 criterion = "0.2"
